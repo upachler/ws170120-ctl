@@ -1,6 +1,6 @@
 use clap::Parser;
 use nusb::DeviceInfo;
-use std::{error::Error, fs::OpenOptions, io::Write, process};
+use std::{error::Error, process};
 
 /// Control the brightness of a Waveshare WS170120 display
 #[derive(Parser)]
@@ -38,143 +38,40 @@ fn find_ws170120_device() -> Result<DeviceInfo, String> {
     Err("Waveshare monitor WS170120 is not connected.".to_string())
 }
 
-fn find_hidraw_device() -> Result<String, String> {
-    use std::fs;
-    use std::path::Path;
-
-    // First verify the device exists via USB enumeration
-    let _device_info = find_ws170120_device()?;
-
-    // On macOS and Linux, look for hidraw devices
-    let sys_devices_path = "/sys/class/hidraw";
-    if Path::new(sys_devices_path).exists() {
-        // Linux approach - scan /sys/class/hidraw
-        let entries = fs::read_dir(sys_devices_path)
-            .map_err(|e| format!("Failed to read {}: {}", sys_devices_path, e))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-            let hidraw_name = entry.file_name();
-            let hidraw_path = format!("/dev/{}", hidraw_name.to_string_lossy());
-
-            // Check if this hidraw device belongs to our WS170120
-            let device_path = entry.path().join("device");
-            if let Ok(uevent_path) = fs::canonicalize(device_path.join("uevent")) {
-                if let Ok(uevent_content) = fs::read_to_string(uevent_path) {
-                    if uevent_content.contains(&format!(
-                        "HID_ID=0003:{:04X}:{:04X}",
-                        WS170120_VENDOR_ID, WS170120_PRODUCT_ID
-                    )) {
-                        return Ok(hidraw_path);
-                    }
-                }
-            }
-        }
-    }
-
-    // macOS approach - scan /dev for potential HID devices
-    #[cfg(target_os = "macos")]
+fn translate_device_error(title: &str, e: impl Error) -> String {
+    let err_str = e.to_string().to_lowercase();
+    if err_str.contains("access denied")
+        || err_str.contains("exclusive access")
+        || err_str.contains("permission denied")
     {
-        use std::fs;
-
-        // On macOS, we need to find the device in /dev
-        // The device enumeration confirmed it exists via USB
-        let dev_entries =
-            fs::read_dir("/dev").map_err(|e| format!("Failed to read /dev directory: {}", e))?;
-
-        for entry in dev_entries {
-            if let Ok(entry) = entry {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-
-                // Look for devices that might be our HID device
-                // On macOS, these are often named like /dev/hidg*, /dev/usb*, or similar
-                if name_str.starts_with("hidg")
-                    || name_str.starts_with("usb")
-                    || name_str.contains("hid")
-                {
-                    let device_path = format!("/dev/{}", name_str);
-
-                    // Try to open the device to see if it's accessible
-                    if let Ok(_) = fs::File::open(&device_path) {
-                        // For now, try the first accessible HID-like device
-                        // This is a simplified approach - in production you'd want
-                        // to verify this is actually the WS170120
-                        return Ok(device_path);
-                    }
-                }
-            }
-        }
-
-        return Err("Could not find accessible HID device on macOS. The device may require different permissions or a different approach.".to_string());
+        format!("{title}: Device access denied. Try running with elevated privileges (sudo). Error message was {e:?}")
+    } else {
+        format!("{title}: Failed to open device: {e}")
     }
-
-    Err("Could not find hidraw device for WS170120.".to_string())
 }
 
-async fn set_brightness_direct_write(
-    device_path: &str,
-    brightness: u8,
-    verbose: u8,
-) -> Result<(), String> {
-    // Prepare the data buffer exactly like the Python version
-    let mut data_buffer = [0u8; DATA_LENGTH];
-    data_buffer[..CONTROL_MAGIC.len()].copy_from_slice(&CONTROL_MAGIC);
-    data_buffer[BRIGHTNESS_ADDRESS] = brightness;
-
-    // Open device file directly and write data
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device_path)
-        .map_err(|e| {
-            let err_str = e.to_string().to_lowercase();
-            if err_str.contains("permission denied") || err_str.contains("access denied") {
-                format!(
-                    "Device access denied: {}. Try running with elevated privileges (sudo).",
-                    e
-                )
-            } else {
-                format!("Failed to open device {}: {}", device_path, e)
-            }
-        })?;
-
-    let bytes_written = file
-        .write(&data_buffer)
-        .map_err(|e| format!("Failed to write brightness data: {}", e))?;
-
-    if bytes_written != DATA_LENGTH {
-        return Err(format!(
-            "Unexpected result {} from writing brightness data, expected {}.",
-            bytes_written, DATA_LENGTH
-        ));
-    }
-
-    file.flush()
-        .map_err(|e| format!("Failed to flush data to device: {}", e))?;
-
-    if verbose > 0 {
-        println!("Brightness has been set to {}%.", brightness);
-    }
-
-    Ok(())
-}
-
-async fn set_brightness_usb(
+async fn set_brightness(
     device_info: &DeviceInfo,
     brightness: u8,
     verbose: u8,
 ) -> Result<(), String> {
+    // Brightness validation is now handled by clap's value parser
+
     let device = device_info
         .open()
-        .map_err(|e| format!("Failed to open device: {}", e))?;
+        .map_err(|e| translate_device_error("opening device failed", e))?;
+
+    // Claim the HID interface (typically interface 0)
+    let interface = device
+        .claim_interface(0)
+        .map_err(|e| translate_device_error("claim_interface on device failed", e))?;
 
     // Prepare the data buffer
     let mut data_buffer = [0u8; DATA_LENGTH];
     data_buffer[..CONTROL_MAGIC.len()].copy_from_slice(&CONTROL_MAGIC);
     data_buffer[BRIGHTNESS_ADDRESS] = brightness;
 
-    // Try control transfer without claiming interface
+    // For HID devices, we use control transfers (HID Set Report)
     let transfer = nusb::transfer::ControlOut {
         control_type: nusb::transfer::ControlType::Class,
         recipient: nusb::transfer::Recipient::Interface,
@@ -184,7 +81,7 @@ async fn set_brightness_usb(
         data: &data_buffer,
     };
 
-    let result = device.control_out(transfer).await;
+    let result = interface.control_out(transfer).await;
 
     match result.status {
         Ok(()) => {
@@ -200,44 +97,51 @@ async fn set_brightness_usb(
             }
             Ok(())
         }
-        Err(e) => Err(format!(
-            "Failed to write brightness data via control transfer: {}",
-            e
-        )),
-    }
-}
-
-async fn set_brightness(brightness: u8, verbose: u8) -> Result<(), String> {
-    if verbose > 0 {
-        println!("Attempting to set brightness to {}%.", brightness);
-    }
-
-    // First, try to find and use hidraw device (like Python version)
-    match find_hidraw_device() {
-        Ok(device_path) => {
-            if verbose > 1 {
-                println!("Found hidraw device: {}", device_path);
-            }
-            return set_brightness_direct_write(&device_path, brightness, verbose).await;
-        }
         Err(e) => {
-            if verbose > 1 {
-                println!("Could not find hidraw device: {}", e);
-                println!("Falling back to USB control transfer...");
+            // If control transfer fails, try interrupt transfer as fallback
+            if verbose > 0 {
+                println!("Control transfer failed, trying interrupt transfer...");
+            }
+
+            // Try interrupt out transfer
+            let interrupt_result = interface.interrupt_out(0x01, data_buffer.to_vec()).await;
+
+            match interrupt_result.status {
+                Ok(()) => {
+                    if interrupt_result.data.actual_length() != DATA_LENGTH {
+                        return Err(format!(
+                            "Unexpected result {} from writing brightness data, expected {}.",
+                            interrupt_result.data.actual_length(), DATA_LENGTH
+                        ));
+                    }
+                    if verbose > 0 {
+                        println!("Brightness has been set to {}%.", brightness);
+                    }
+                    Ok(())
+                }
+                Err(e2) => Err(format!("Failed to write brightness data via both control and interrupt transfers. Control error: {}, Interrupt error: {}", e, e2)),
             }
         }
     }
-
-    // Fallback to USB control transfer
-    let device_info = find_ws170120_device()?;
-    set_brightness_usb(&device_info, brightness, verbose).await
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    if let Err(e) = set_brightness(args.brightness, args.verbose).await {
+    if args.verbose > 0 {
+        println!("Attempting to set brightness to {}%.", args.brightness);
+    }
+
+    let device_info = match find_ws170120_device() {
+        Ok(device) => device,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
+
+    if let Err(e) = set_brightness(&device_info, args.brightness, args.verbose).await {
         eprintln!("{}", e);
         process::exit(1);
     }
