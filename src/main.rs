@@ -1,5 +1,5 @@
 use clap::Parser;
-use nusb::DeviceInfo;
+use hidapi::{HidApi, HidDevice};
 use std::{error::Error, process};
 
 /// Control the brightness of a Waveshare WS170120 display
@@ -26,16 +26,17 @@ const DATA_LENGTH: usize = 38;
 const BRIGHTNESS_ADDRESS: usize = 6;
 const CONTROL_MAGIC: [u8; 4] = [0x04, 0xaa, 0x01, 0x00];
 
-fn find_ws170120_device() -> Result<DeviceInfo, String> {
-    let devices = nusb::list_devices().map_err(|e| format!("Failed to list USB devices: {}", e))?;
+fn find_ws170120_device(api: &HidApi) -> Result<HidDevice, String> {
+    let device_info = api
+        .device_list()
+        .find(|info| {
+            info.vendor_id() == WS170120_VENDOR_ID && info.product_id() == WS170120_PRODUCT_ID
+        })
+        .ok_or_else(|| "Waveshare monitor WS170120 is not connected.".to_string())?;
 
-    for device in devices {
-        if device.vendor_id() == WS170120_VENDOR_ID && device.product_id() == WS170120_PRODUCT_ID {
-            return Ok(device);
-        }
-    }
-
-    Err("Waveshare monitor WS170120 is not connected.".to_string())
+    device_info
+        .open_device(api)
+        .map_err(|e| translate_device_error("opening device failed", e))
 }
 
 fn translate_device_error(title: &str, e: impl Error) -> String {
@@ -50,46 +51,23 @@ fn translate_device_error(title: &str, e: impl Error) -> String {
     }
 }
 
-async fn set_brightness(
-    device_info: &DeviceInfo,
-    brightness: u8,
-    verbose: u8,
-) -> Result<(), String> {
+fn set_brightness(device: &HidDevice, brightness: u8, verbose: u8) -> Result<(), String> {
     // Brightness validation is now handled by clap's value parser
-
-    let device = device_info
-        .open()
-        .map_err(|e| translate_device_error("opening device failed", e))?;
-
-    // Claim the HID interface (typically interface 0)
-    let interface = device
-        .claim_interface(0)
-        .map_err(|e| translate_device_error("claim_interface on device failed", e))?;
 
     // Prepare the data buffer
     let mut data_buffer = [0u8; DATA_LENGTH];
     data_buffer[..CONTROL_MAGIC.len()].copy_from_slice(&CONTROL_MAGIC);
     data_buffer[BRIGHTNESS_ADDRESS] = brightness;
 
-    // For HID devices, we use control transfers (HID Set Report)
-    let transfer = nusb::transfer::ControlOut {
-        control_type: nusb::transfer::ControlType::Class,
-        recipient: nusb::transfer::Recipient::Interface,
-        request: 0x09, // HID Set Report
-        value: 0x0200, // Report Type: Output (0x02), Report ID: 0x00
-        index: 0,      // Interface number
-        data: &data_buffer,
-    };
+    // For HID devices, we use write to send the report
+    let result = device.write(&data_buffer);
 
-    let result = interface.control_out(transfer).await;
-
-    match result.status {
-        Ok(()) => {
-            if result.data.actual_length() != DATA_LENGTH {
+    match result {
+        Ok(bytes_written) => {
+            if bytes_written != DATA_LENGTH {
                 return Err(format!(
                     "Unexpected result {} from writing brightness data, expected {}.",
-                    result.data.actual_length(),
-                    DATA_LENGTH
+                    bytes_written, DATA_LENGTH
                 ));
             }
             if verbose > 0 {
@@ -98,42 +76,46 @@ async fn set_brightness(
             Ok(())
         }
         Err(e) => {
-            // If control transfer fails, try interrupt transfer as fallback
+            // If regular write fails, try send_feature_report as fallback
             if verbose > 0 {
-                println!("Control transfer failed, trying interrupt transfer...");
+                println!("Regular write failed, trying feature report...");
             }
 
-            // Try interrupt out transfer
-            let interrupt_result = interface.interrupt_out(0x01, data_buffer.to_vec()).await;
+            let feature_result = device.send_feature_report(&data_buffer);
 
-            match interrupt_result.status {
+            match feature_result {
                 Ok(()) => {
-                    if interrupt_result.data.actual_length() != DATA_LENGTH {
-                        return Err(format!(
-                            "Unexpected result {} from writing brightness data, expected {}.",
-                            interrupt_result.data.actual_length(), DATA_LENGTH
-                        ));
-                    }
                     if verbose > 0 {
                         println!("Brightness has been set to {}%.", brightness);
                     }
                     Ok(())
                 }
-                Err(e2) => Err(format!("Failed to write brightness data via both control and interrupt transfers. Control error: {}, Interrupt error: {}", e, e2)),
+                Err(e2) => Err(format!(
+                    "Failed to write brightness data via both regular write and feature report. Write error: {}, Feature report error: {}",
+                    e, e2
+                )),
             }
         }
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = Args::parse();
 
     if args.verbose > 0 {
         println!("Attempting to set brightness to {}%.", args.brightness);
     }
 
-    let device_info = match find_ws170120_device() {
+    // Initialize HID API
+    let api = match HidApi::new() {
+        Ok(api) => api,
+        Err(e) => {
+            eprintln!("Failed to initialize HID API: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let device = match find_ws170120_device(&api) {
         Ok(device) => device,
         Err(e) => {
             eprintln!("{}", e);
@@ -141,7 +123,7 @@ async fn main() {
         }
     };
 
-    if let Err(e) = set_brightness(&device_info, args.brightness, args.verbose).await {
+    if let Err(e) = set_brightness(&device, args.brightness, args.verbose) {
         eprintln!("{}", e);
         process::exit(1);
     }

@@ -4,7 +4,7 @@ A command-line utility to control the brightness of a Waveshare WS170120 17-inch
 
 ## Description
 
-This Rust application provides cross-platform USB communication to adjust the brightness of Waveshare WS170120 displays. It uses the `nusb` crate for cross-platform USB functionality and implements the same USB protocol as the original Python implementation.
+This Rust application provides cross-platform USB communication to adjust the brightness of Waveshare WS170120 displays. It uses the `hidapi` crate for cross-platform USB functionality and implements the same USB protocol as the original Python implementation.
 
 ## Features
 
